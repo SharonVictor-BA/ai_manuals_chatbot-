@@ -2,19 +2,22 @@ import os, json, re, hashlib
 import streamlit as st
 import pandas as pd, numpy as np
 from sentence_transformers import SentenceTransformer
-import faiss
+from sklearn.metrics.pairwise import cosine_similarity
 from rank_bm25 import BM25Okapi
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline
 import pdfplumber, pytesseract
 from pdf2image import convert_from_path
 from unidecode import unidecode
 
+# ===============================================
+# Streamlit setup
+# ===============================================
 st.set_page_config(page_title="AI Manuals Chatbot", layout="wide")
 st.title("🧠 AI-Powered Machinery Manual Chatbot")
 st.markdown("Upload manuals (PDFs), extract specs, and ask natural questions about them.")
 
 # ===============================================
-# Sidebar – Upload Manuals
+# Directory setup
 # ===============================================
 uploaded_files = st.sidebar.file_uploader("Upload PDF Manuals", type=["pdf"], accept_multiple_files=True)
 manual_dir = "data/manuals"
@@ -23,16 +26,21 @@ text_cache = "data/text_cache.jsonl"
 out_dir = "data/outputs"
 os.makedirs(out_dir, exist_ok=True)
 
+# ===============================================
+# PDF → Text Extraction (with OCR fallback)
+# ===============================================
 def read_pdf_text(pdf_file):
     pages_text = []
     with pdfplumber.open(pdf_file) as pdf:
         for i, page in enumerate(pdf.pages, start=1):
             txt = page.extract_text() or ""
             pages_text.append((i, unidecode(txt)))
-    # OCR fallback
+
+    # OCR fallback if text extraction is too light
     if sum(len(t) for _, t in pages_text) < 400:
         images = convert_from_path(pdf_file, dpi=150)
         pages_text = [(i+1, unidecode(pytesseract.image_to_string(im))) for i, im in enumerate(images)]
+
     clean = []
     for pnum, t in pages_text:
         t = re.sub(r"[ \t]+", " ", t)
@@ -47,6 +55,7 @@ if uploaded_files:
             with open(path, "wb") as fp:
                 fp.write(f.getbuffer())
             st.sidebar.success(f"✅ Saved {f.name}")
+
             for pnum, txt in read_pdf_text(path):
                 rec = {"file": f.name, "page": pnum, "text": txt}
                 cache.write(json.dumps(rec) + "\n")
@@ -71,17 +80,17 @@ if len(texts) == 0:
     st.stop()
 
 # ===============================================
-# Build Retrieval Index
+# Build Retrieval Index (scikit-learn + BM25)
 # ===============================================
-st.sidebar.write("Building retrieval index...")
+st.sidebar.write("🔍 Building retrieval index...")
 embed_model = SentenceTransformer("all-MiniLM-L6-v2")
+
+# Compute embeddings
 embs = embed_model.encode(texts, show_progress_bar=False, normalize_embeddings=True)
-index = faiss.IndexFlatIP(embs.shape[1])
-index.add(embs.astype(np.float32))
 bm25 = BM25Okapi([t.split() for t in texts])
 
 # ===============================================
-# LLM Model
+# Load LLM Model (FLAN-T5)
 # ===============================================
 tok = AutoTokenizer.from_pretrained("google/flan-t5-small")
 gen_model = AutoModelForSeq2SeqLM.from_pretrained("google/flan-t5-small")
@@ -91,22 +100,30 @@ generator = pipeline("text2text-generation", model=gen_model, tokenizer=tok)
 # Helper: Retrieval + Answer Synthesis
 # ===============================================
 def retrieve(query, top_k=5):
+    """Retrieve top_k most similar text chunks using cosine similarity + BM25."""
     q_emb = embed_model.encode([query], normalize_embeddings=True)
-    D, I = index.search(q_emb.astype(np.float32), top_k)
-    sem_hits = [(texts[i], meta[i]) for i in I[0]]
+    sims = cosine_similarity(q_emb, embs)[0]
+    top_idx = np.argsort(sims)[::-1][:top_k]
+    sem_hits = [(texts[i], meta[i]) for i in top_idx]
+
     bm_hits = bm25.get_top_n(query.split(), list(range(len(texts))), n=top_k)
     bm_hits = [(texts[i], meta[i]) for i in bm_hits]
+
+    # Merge results while removing duplicates
     seen, out = set(), []
-    for t,m in sem_hits + bm_hits:
-        key = hashlib.md5((m+t).encode()).hexdigest()
+    for t, m in sem_hits + bm_hits:
+        key = hashlib.md5((m + t).encode()).hexdigest()
         if key not in seen:
-            out.append((t,m)); seen.add(key)
-        if len(out) >= top_k: break
+            out.append((t, m))
+            seen.add(key)
+        if len(out) >= top_k:
+            break
     return out
 
 def generate_answer(question):
+    """Generate grounded answers using retrieved context."""
     ctxs = retrieve(question)
-    context_text = "\n\n---\n\n".join([f"{m}: {t[:600]}" for t,m in ctxs])
+    context_text = "\n\n---\n\n".join([f"{m}: {t[:600]}" for t, m in ctxs])
     prompt = f"""You are a technical assistant answering only from manuals.
 
 Question: {question}
